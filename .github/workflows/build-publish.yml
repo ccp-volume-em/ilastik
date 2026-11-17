@@ -12,7 +12,7 @@ on:
         type: string
         default: '3.1.4'
       latest:
-        description: Set latest tag (on the -cpu image)
+        description: Set latest tag
         type: boolean
         default: false
 
@@ -20,29 +20,21 @@ env:
   IMAGE: quay.io/ccp-volume-em/ilastik
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-container:
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: cpu
-            file: Dockerfile
-            target: ''
-          - variant: gpu
-            file: Dockerfile-gpu
-            target: gpu
-          - variant: gpu-vgl
-            file: Dockerfile-gpu
-            target: vgl
+      id-token: write
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Get build timestamp
+      - name: Get build timestamp and image version base
         id: meta
-        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        env:
+          ILASTIK: ${{ inputs.ilastik_version }}
+        run: |
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "version=${ILASTIK}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Quay.io
         uses: docker/login-action@v4
@@ -53,71 +45,82 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build and push
-        id: build
+      - uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Build and push ilastik CPU image
+        id: build-cpu
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ${{ matrix.file }}
-          target: ${{ matrix.target }}
+          file: Dockerfile
           push: true
           provenance: true
           sbom: true
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,scope=${{ matrix.variant }},mode=max
           tags: |
-            ${{ env.IMAGE }}:${{ inputs.ilastik_version }}-${{ matrix.variant }}
-            ${{ (matrix.variant == 'cpu' && inputs.latest) && format('{0}:latest', env.IMAGE) || '' }}
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-cpu
+            ${{ inputs.latest && format('{0}:latest', env.IMAGE) || '' }}
           build-args: |
             ILASTIK_VERSION=${{ inputs.ilastik_version }}
-            VGL_VERSION=${{ inputs.virtualgl_version }}
-            IMAGE_VERSION=${{ inputs.ilastik_version }}-${{ matrix.variant }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-cpu
             IMAGE_REVISION=${{ github.sha }}
             IMAGE_CREATED=${{ steps.meta.outputs.created }}
 
-      - name: Save digest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "${DIGEST}" > digest-${{ matrix.variant }}.txt
-
-      - uses: actions/upload-artifact@v7
+      - name: Build and push ilastik GPU image
+        id: build-gpu
+        uses: docker/build-push-action@v7
         with:
-          name: digest-${{ matrix.variant }}
-          path: digest-${{ matrix.variant }}.txt
+          context: .
+          file: Dockerfile-gpu
+          target: gpu
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-gpu
+          build-args: |
+            ILASTIK_VERSION=${{ inputs.ilastik_version }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-gpu
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
 
-  sign:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v8
+      - name: Build and push ilastik GPU image with VirtualGL
+        id: build-gpu-vgl
+        uses: docker/build-push-action@v7
         with:
-          pattern: digest-*
-          merge-multiple: true
-
-      - name: Log in to Quay.io
-        uses: docker/login-action@v4
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
-      - uses: sigstore/cosign-installer@v4.1.0
+          context: .
+          file: Dockerfile-gpu
+          target: vgl
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-gpu-vgl
+          build-args: |
+            ILASTIK_VERSION=${{ inputs.ilastik_version }}
+            VGL_VERSION=${{ inputs.virtualgl_version }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-gpu-vgl
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
 
       - name: Sign images
+        env:
+          DIGEST_CPU: ${{ steps.build-cpu.outputs.digest }}
+          DIGEST_GPU: ${{ steps.build-gpu.outputs.digest }}
+          DIGEST_VGL: ${{ steps.build-gpu-vgl.outputs.digest }}
         run: |
-          for f in digest-*.txt; do
-            cosign sign --yes "${IMAGE}@$(cat "$f")"
-          done
+          cosign sign --yes "${IMAGE}@${DIGEST_CPU}"
+          cosign sign --yes "${IMAGE}@${DIGEST_GPU}"
+          cosign sign --yes "${IMAGE}@${DIGEST_VGL}"
 
       - name: Verify signatures
         env:
+          DIGEST_CPU: ${{ steps.build-cpu.outputs.digest }}
+          DIGEST_GPU: ${{ steps.build-gpu.outputs.digest }}
+          DIGEST_VGL: ${{ steps.build-gpu-vgl.outputs.digest }}
           IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/build-publish.yml@${{ github.ref }}
         run: |
-          for f in digest-*.txt; do
-            cosign verify "${IMAGE}@$(cat "$f")" \
+          for d in "${DIGEST_CPU}" "${DIGEST_GPU}" "${DIGEST_VGL}"; do
+            cosign verify "${IMAGE}@${d}" \
               --certificate-identity "${IDENTITY}" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com
           done
