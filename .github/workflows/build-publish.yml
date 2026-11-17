@@ -1,0 +1,126 @@
+name: Build ilastik container images and publish to Quay.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      ilastik_version:
+        description: ilastik version (e.g. 1.4.2)
+        type: string
+        required: true
+      virtualgl_version:
+        description: VirtualGL version for -gpu-vgl tag (e.g. 3.1.4)
+        type: string
+        default: '3.1.4'
+      latest:
+        description: Set latest tag
+        type: boolean
+        default: false
+
+env:
+  IMAGE: quay.io/ccp-volume-em/ilastik
+
+jobs:
+  build-container:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get build timestamp and image version base
+        id: meta
+        env:
+          ILASTIK: ${{ inputs.ilastik_version }}
+        run: |
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "version=${ILASTIK}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Quay.io
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Build and push ilastik CPU image
+        id: build-cpu
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-cpu
+            ${{ inputs.latest && format('{0}:latest', env.IMAGE) || '' }}
+          build-args: |
+            ILASTIK_VERSION=${{ inputs.ilastik_version }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-cpu
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Build and push ilastik GPU image
+        id: build-gpu
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile-gpu
+          target: gpu
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-gpu
+          build-args: |
+            ILASTIK_VERSION=${{ inputs.ilastik_version }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-gpu
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Build and push ilastik GPU image with VirtualGL
+        id: build-gpu-vgl
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile-gpu
+          target: vgl
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}-gpu-vgl
+          build-args: |
+            ILASTIK_VERSION=${{ inputs.ilastik_version }}
+            VGL_VERSION=${{ inputs.virtualgl_version }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}-gpu-vgl
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_CREATED=${{ steps.meta.outputs.created }}
+
+      - name: Sign images
+        env:
+          DIGEST_CPU: ${{ steps.build-cpu.outputs.digest }}
+          DIGEST_GPU: ${{ steps.build-gpu.outputs.digest }}
+          DIGEST_VGL: ${{ steps.build-gpu-vgl.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST_CPU}"
+          cosign sign --yes "${IMAGE}@${DIGEST_GPU}"
+          cosign sign --yes "${IMAGE}@${DIGEST_VGL}"
+
+      - name: Verify signatures
+        env:
+          DIGEST_CPU: ${{ steps.build-cpu.outputs.digest }}
+          DIGEST_GPU: ${{ steps.build-gpu.outputs.digest }}
+          DIGEST_VGL: ${{ steps.build-gpu-vgl.outputs.digest }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/build-publish.yml@${{ github.ref }}
+        run: |
+          for d in "${DIGEST_CPU}" "${DIGEST_GPU}" "${DIGEST_VGL}"; do
+            cosign verify "${IMAGE}@${d}" \
+              --certificate-identity "${IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          done
