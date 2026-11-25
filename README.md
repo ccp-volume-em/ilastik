@@ -4,6 +4,8 @@ the interactive learning and segmentation toolkit,
 maintained by the Rosalind Franklin Institute and the Collaborative
 Computational Project for Volume Electron Microscopy (CCP-volumeEM).
 
+Documentation for using the container: [rosalindfranklininstitute.github.io/volume-em-container-documentation/software/ilastik/](https://rosalindfranklininstitute.github.io/volume-em-container-documentation/software/ilastik)
+
 ## Images
 
 Images are published to
